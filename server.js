@@ -170,4 +170,6 @@ app.post("/api/payments",async(req,res)=>{const {studentId,month,amount,note=""}
 app.post("/api/share-links",async(req,res)=>{const {studentId}=req.body;if(!studentId)return bad(res,"studentId is required");let row=await db.get("SELECT * FROM share_links WHERE studentId=?",[studentId]);if(!row){const token=crypto.randomBytes(18).toString("base64url");const r=await db.run("INSERT INTO share_links(studentId,token) VALUES(?,?)",[studentId,token]);row=await db.get("SELECT * FROM share_links WHERE id=?",[r.lastID]);}ok(res,row);});
 app.get("/api/share/:token",async(req,res)=>{const link=await db.get("SELECT * FROM share_links WHERE token=?",[req.params.token]);if(!link)return bad(res,"Share link not found",404);const student=await db.get("SELECT id,name,className FROM students WHERE id=?",[link.studentId]);const schedules=await db.all("SELECT * FROM schedules WHERE studentId=? OR (studentId IS NULL AND className=?) ORDER BY id",[student.id,student.className]);ok(res,{student,schedules});});
 
-app.listen(PORT,()=>console.log(`Backend running: http://localhost:${PORT}`));
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`Backend running: http://0.0.0.0:${PORT}`);
+});
