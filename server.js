@@ -1,404 +1,336 @@
 import express from "express";
 import cors from "cors";
-import sqlite3 from "sqlite3";
-import { open } from "sqlite";
-import path from "path";
-import fs from "fs/promises";
+import pg from "pg";
 import crypto from "crypto";
-import { fileURLToPath } from "url";
+import "dotenv/config";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const { Pool } = pg;
 
-/* =========================================================
- * DATABASE
- * ========================================================= */
+const PORT = Number(process.env.PORT || 4000);
 
-const dataDir = path.join(__dirname, "data");
-await fs.mkdir(dataDir, { recursive: true });
-
-const db = await open({
-  filename: path.join(dataDir, "teacher_schedule.db"),
-  driver: sqlite3.Database,
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL?.includes("render.com")
+    ? { rejectUnauthorized: false }
+    : false,
+  connectionTimeoutMillis: 15000,
+  idleTimeoutMillis: 30000,
 });
 
+const q = async (text, params = []) => {
+  const result = await pool.query(text, params);
+  return result.rows;
+};
+
 /*
- * Tạo toàn bộ database schema.
- *
- * QUAN TRỌNG:
- * Render tạo database mới nên tất cả table phải được CREATE
- * trước khi chạy SELECT / INSERT / ALTER TABLE.
+ * ============================================================
+ * DATE HELPERS
+ * ============================================================
  */
-await db.exec(`
-  CREATE TABLE IF NOT EXISTS app_settings (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    teacherName TEXT NOT NULL DEFAULT 'Nguyễn Thị Nam Giang',
-    teacherPhone TEXT NOT NULL DEFAULT '123',
-    bankAccount TEXT NOT NULL DEFAULT '12345',
-    bankOwner TEXT NOT NULL DEFAULT 'Nguyễn Thị Nam Giang',
-    bankName TEXT NOT NULL DEFAULT 'MB Bank',
-    parentNote TEXT NOT NULL DEFAULT 'Vui lòng thanh toán học phí đúng hạn. Khi chuyển khoản, phụ huynh vui lòng ghi rõ họ tên học sinh để giáo viên dễ dàng kiểm tra.'
+
+function pad2(value) {
+  return String(value).padStart(2, "0");
+}
+
+function formatDate(date) {
+  const year = date.getFullYear();
+  const month = pad2(date.getMonth() + 1);
+  const day = pad2(date.getDate());
+
+  return year + "-" + month + "-" + day;
+}
+
+function getFirstDayOfMonth(date = new Date()) {
+  return formatDate(
+    new Date(
+      date.getFullYear(),
+      date.getMonth(),
+      1
+    )
+  );
+}
+
+function getLastDayOfMonth(date = new Date()) {
+  return formatDate(
+    new Date(
+      date.getFullYear(),
+      date.getMonth() + 1,
+      0
+    )
+  );
+}
+
+function isValidDateString(value) {
+  if (
+    !value ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(value)
+  ) {
+    return false;
+  }
+
+  const parts = value.split("-");
+
+  const year = Number(parts[0]);
+  const month = Number(parts[1]);
+  const day = Number(parts[2]);
+
+  const date = new Date(
+    year,
+    month - 1,
+    day
   );
 
-  CREATE TABLE IF NOT EXISTS students (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    className TEXT NOT NULL,
-    phone TEXT NOT NULL DEFAULT '',
-    note TEXT NOT NULL DEFAULT '',
-    feePerLesson INTEGER NOT NULL DEFAULT 100000,
-    active INTEGER NOT NULL DEFAULT 1
+  return (
+    date.getFullYear() === year &&
+    date.getMonth() === month - 1 &&
+    date.getDate() === day
   );
+}
 
-  CREATE TABLE IF NOT EXISTS classes (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE,
-    teacher TEXT NOT NULL DEFAULT 'Nguyễn Văn An'
-  );
+function getDateRange(req) {
+  const now = new Date();
 
-  CREATE TABLE IF NOT EXISTS time_slots (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    startTime TEXT NOT NULL,
-    endTime TEXT NOT NULL,
-    sortOrder INTEGER NOT NULL
-  );
+  const from =
+    req.query.from ||
+    getFirstDayOfMonth(now);
 
-  CREATE TABLE IF NOT EXISTS schedules (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    day TEXT NOT NULL,
-    time TEXT NOT NULL,
-    subject TEXT NOT NULL,
-    className TEXT NOT NULL,
-    room TEXT NOT NULL DEFAULT '',
-    studentId INTEGER DEFAULT NULL
-  );
+  const to =
+    req.query.to ||
+    getLastDayOfMonth(now);
 
-  CREATE TABLE IF NOT EXISTS attendance (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    studentId INTEGER NOT NULL,
-    scheduleId INTEGER DEFAULT NULL,
-    lessonDate TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'attended',
-    fee INTEGER NOT NULL DEFAULT 0,
-    note TEXT NOT NULL DEFAULT '',
-    UNIQUE(studentId, scheduleId, lessonDate)
-  );
+  if (!isValidDateString(from)) {
+    throw new Error(
+      "Ngày bắt đầu không hợp lệ: " + from
+    );
+  }
 
-  CREATE TABLE IF NOT EXISTS payments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    studentId INTEGER NOT NULL,
-    month TEXT NOT NULL,
-    amount INTEGER NOT NULL,
-    paidAt TEXT NOT NULL,
-    note TEXT NOT NULL DEFAULT ''
-  );
+  if (!isValidDateString(to)) {
+    throw new Error(
+      "Ngày kết thúc không hợp lệ: " + to
+    );
+  }
 
-  CREATE TABLE IF NOT EXISTS share_links (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    studentId INTEGER NOT NULL,
-    token TEXT NOT NULL UNIQUE
-  );
+  return {
+    from,
+    to,
+  };
+}
+
+/*
+ * ============================================================
+ * DATABASE INITIALIZATION
+ * ============================================================
+ */
+
+await q(`
+CREATE TABLE IF NOT EXISTS app_settings (
+  id INTEGER PRIMARY KEY,
+  teacher_name TEXT NOT NULL DEFAULT 'Giáo viên',
+  teacher_phone TEXT NOT NULL DEFAULT '',
+  bank_account TEXT NOT NULL DEFAULT '',
+  bank_owner TEXT NOT NULL DEFAULT '',
+  bank_name TEXT NOT NULL DEFAULT 'MB Bank',
+  parent_note TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS students (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  class_name TEXT NOT NULL,
+  phone TEXT NOT NULL DEFAULT '',
+  note TEXT NOT NULL DEFAULT '',
+  fee_per_lesson INTEGER NOT NULL DEFAULT 100000,
+  active BOOLEAN NOT NULL DEFAULT TRUE
+);
+
+CREATE TABLE IF NOT EXISTS classes (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  teacher TEXT NOT NULL DEFAULT 'Giáo viên'
+);
+
+CREATE TABLE IF NOT EXISTS time_slots (
+  id SERIAL PRIMARY KEY,
+  name TEXT NOT NULL,
+  start_time TEXT NOT NULL,
+  end_time TEXT NOT NULL,
+  sort_order INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS schedules (
+  id SERIAL PRIMARY KEY,
+  day TEXT NOT NULL,
+  time TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  class_name TEXT NOT NULL,
+  room TEXT NOT NULL DEFAULT '',
+  student_id INTEGER REFERENCES students(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS lessons (
+  id SERIAL PRIMARY KEY,
+  student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  schedule_id INTEGER REFERENCES schedules(id) ON DELETE SET NULL,
+  lesson_date DATE NOT NULL,
+  time TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  class_name TEXT NOT NULL DEFAULT '',
+  room TEXT NOT NULL DEFAULT '',
+  fee INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending'
+    CHECK(status IN ('pending','attended','absent')),
+  is_extra BOOLEAN NOT NULL DEFAULT FALSE,
+  cancelled BOOLEAN NOT NULL DEFAULT FALSE,
+  UNIQUE(student_id, schedule_id, lesson_date)
+);
+
+CREATE TABLE IF NOT EXISTS attendance (
+  id SERIAL PRIMARY KEY,
+  student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  lesson_id INTEGER REFERENCES lessons(id) ON DELETE CASCADE,
+  schedule_id INTEGER REFERENCES schedules(id) ON DELETE SET NULL,
+  lesson_date DATE NOT NULL,
+  status TEXT NOT NULL DEFAULT 'attended',
+  fee INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT '',
+  UNIQUE(student_id, lesson_id, lesson_date)
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+  id SERIAL PRIMARY KEY,
+  student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  month TEXT NOT NULL,
+  amount INTEGER NOT NULL,
+  paid_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  note TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS share_links (
+  id SERIAL PRIMARY KEY,
+  student_id INTEGER NOT NULL REFERENCES students(id) ON DELETE CASCADE,
+  token TEXT NOT NULL UNIQUE
+);
 `);
 
-/* =========================================================
- * DEFAULT SETTINGS
- * ========================================================= */
+/*
+ * ============================================================
+ * MIGRATION
+ * ============================================================
+ */
 
-if (!(await db.get("SELECT id FROM app_settings WHERE id = 1"))) {
-  await db.run(`
-    INSERT INTO app_settings (
-      id,
-      teacherName,
-      teacherPhone,
-      bankAccount,
-      bankOwner,
-      bankName,
-      parentNote
+await q(`
+ALTER TABLE attendance
+ADD COLUMN IF NOT EXISTS lesson_id
+INTEGER REFERENCES lessons(id) ON DELETE CASCADE
+`);
+
+await q(`
+INSERT INTO app_settings(
+  id,
+  teacher_name,
+  teacher_phone,
+  bank_account,
+  bank_owner,
+  bank_name,
+  parent_note
+)
+VALUES(
+  1,
+  'Giáo viên',
+  '',
+  '',
+  '',
+  'MB Bank',
+  'Vui lòng thanh toán học phí đúng hạn.'
+)
+ON CONFLICT(id) DO NOTHING
+`);
+
+if (!(await q(`SELECT 1 FROM time_slots LIMIT 1`))[0]) {
+  await q(`
+    INSERT INTO time_slots(
+      name,
+      start_time,
+      end_time,
+      sort_order
     )
-    VALUES (
-      1,
-      'Nguyễn Thị Nam Giang',
-      '123',
-      '12345',
-      'Nguyễn Thị Nam Giang',
-      'MB Bank',
-      'Vui lòng thanh toán học phí đúng hạn. Khi chuyển khoản, phụ huynh vui lòng ghi rõ họ tên học sinh để giáo viên dễ dàng kiểm tra.'
-    )
+    VALUES
+      ('Tiết 1','08:00','09:00',1),
+      ('Tiết 2','09:00','10:00',2),
+      ('Tiết 3','10:00','11:00',3),
+      ('Tiết 4','13:30','14:30',4),
+      ('Tiết 5','14:30','15:30',5),
+      ('Tiết 6','15:30','16:30',6)
   `);
 }
 
-/* =========================================================
- * DEFAULT TIME SLOTS
- * ========================================================= */
-
-const timeSlotCount = await db.get(
-  "SELECT COUNT(*) AS count FROM time_slots"
-);
-
-if (timeSlotCount.count === 0) {
-  const defaultTimeSlots = [
-    ["Tiết 1", "08:00", "09:00", 1],
-    ["Tiết 2", "09:00", "10:00", 2],
-    ["Tiết 3", "10:00", "11:00", 3],
-    ["Tiết 4", "13:30", "14:30", 4],
-    ["Tiết 5", "14:30", "15:30", 5],
-    ["Tiết 6", "15:30", "16:30", 6],
-  ];
-
-  for (const [name, startTime, endTime, sortOrder] of defaultTimeSlots) {
-    await db.run(
-      `
-      INSERT INTO time_slots (
-        name,
-        startTime,
-        endTime,
-        sortOrder
-      )
-      VALUES (?, ?, ?, ?)
-      `,
-      name,
-      startTime,
-      endTime,
-      sortOrder
-    );
-  }
-}
-
-/* =========================================================
- * DEFAULT STUDENTS
- * ========================================================= */
-
-const studentCount = await db.get(
-  "SELECT COUNT(*) AS count FROM students"
-);
-
-if (studentCount.count === 0) {
-  const defaultStudents = [
-    [
-      "Nguyễn Minh Anh",
-      "8A",
-      "0901 234 567",
-      "",
-      100000,
-      1,
-    ],
-    [
-      "Trần Gia Huy",
-      "8A",
-      "0902 345 678",
-      "Học tốt môn Toán",
-      100000,
-      1,
-    ],
-    [
-      "Lê Khánh Linh",
-      "8B",
-      "0903 456 789",
-      "",
-      120000,
-      1,
-    ],
-    [
-      "Phạm Đức Minh",
-      "8B",
-      "0904 567 890",
-      "Cần hỗ trợ thêm",
-      120000,
-      1,
-    ],
-    [
-      "Đỗ Hà My",
-      "9A",
-      "0905 678 901",
-      "",
-      150000,
-      1,
-    ],
-  ];
-
-  for (const [
-    name,
-    className,
-    phone,
-    note,
-    feePerLesson,
-    active,
-  ] of defaultStudents) {
-    await db.run(
-      `
-      INSERT INTO students (
-        name,
-        className,
-        phone,
-        note,
-        feePerLesson,
-        active
-      )
-      VALUES (?, ?, ?, ?, ?, ?)
-      `,
-      name,
-      className,
-      phone,
-      note,
-      feePerLesson,
-      active
-    );
-  }
-}
-
-/* =========================================================
- * DEFAULT CLASSES
- * ========================================================= */
-
-const classCount = await db.get(
-  "SELECT COUNT(*) AS count FROM classes"
-);
-
-if (classCount.count === 0) {
-  const defaultClasses = [
-    ["8A", "Nguyễn Văn An"],
-    ["8B", "Nguyễn Văn An"],
-    ["9A", "Nguyễn Văn An"],
-  ];
-
-  for (const [name, teacher] of defaultClasses) {
-    await db.run(
-      `
-      INSERT INTO classes (
-        name,
-        teacher
-      )
-      VALUES (?, ?)
-      `,
-      name,
-      teacher
-    );
-  }
-}
-
-/* =========================================================
- * DEFAULT SCHEDULES
- * ========================================================= */
-
-const scheduleCount = await db.get(
-  "SELECT COUNT(*) AS count FROM schedules"
-);
-
-if (scheduleCount.count === 0) {
-  const defaultSchedules = [
-    ["Thứ 2", "08:00-09:00", "Toán", "8A", "P.101"],
-    ["Thứ 2", "09:00-10:00", "Vật lý", "9A", "P.202"],
-    ["Thứ 3", "08:00-09:00", "Toán", "8B", "P.101"],
-    ["Thứ 3", "10:00-11:00", "Ôn tập", "8A", "P.103"],
-    ["Thứ 4", "09:00-10:00", "Toán", "9A", "P.202"],
-    ["Thứ 4", "13:30-14:30", "Vật lý", "8A", "P.101"],
-    ["Thứ 5", "08:00-09:00", "Toán", "8B", "P.101"],
-    ["Thứ 6", "09:00-10:00", "Ôn tập", "9A", "P.202"],
-  ];
-
-  for (const [
-    day,
-    time,
-    subject,
-    className,
-    room,
-  ] of defaultSchedules) {
-    await db.run(
-      `
-      INSERT INTO schedules (
-        day,
-        time,
-        subject,
-        className,
-        room,
-        studentId
-      )
-      VALUES (?, ?, ?, ?, ?, NULL)
-      `,
-      day,
-      time,
-      subject,
-      className,
-      room
-    );
-  }
-}
-
-/* =========================================================
- * CONVERT CLASS SCHEDULES TO STUDENT SCHEDULES
- * ========================================================= */
-
-/*
- * Nếu schedule cũ chỉ có className và studentId = NULL,
- * copy schedule đó cho từng học sinh đang active trong class.
- *
- * Giữ schedule class-wide ban đầu để không phá dữ liệu cũ.
- */
-
-const classWideSchedules = await db.all(`
-  SELECT *
-  FROM schedules
-  WHERE studentId IS NULL
+await q(`
+UPDATE students
+SET active = TRUE
+WHERE active IS NULL
 `);
 
-for (const schedule of classWideSchedules) {
-  const students = await db.all(
-    `
-    SELECT id
-    FROM students
-    WHERE className = ?
-      AND active = 1
-    `,
-    schedule.className
-  );
+/*
+ * ============================================================
+ * AUTO GENERATE LESSONS
+ * ============================================================
+ */
 
-  for (const student of students) {
-    const existing = await db.get(
-      `
-      SELECT id
-      FROM schedules
-      WHERE day = ?
-        AND time = ?
-        AND subject = ?
-        AND className = ?
-        AND room = ?
-        AND studentId = ?
-      `,
-      schedule.day,
-      schedule.time,
-      schedule.subject,
-      schedule.className,
-      schedule.room,
-      student.id
-    );
+await q(`
+INSERT INTO lessons(
+  student_id,
+  schedule_id,
+  lesson_date,
+  time,
+  subject,
+  class_name,
+  room,
+  fee,
+  status,
+  is_extra
+)
+SELECT
+  s.student_id,
+  s.id,
+  gs.d::date,
+  s.time,
+  s.subject,
+  s.class_name,
+  s.room,
+  COALESCE(st.fee_per_lesson, 0),
+  'pending',
+  false
+FROM schedules s
+JOIN students st
+  ON st.id = s.student_id
+CROSS JOIN LATERAL generate_series(
+  CURRENT_DATE - INTERVAL '31 days',
+  CURRENT_DATE + INTERVAL '31 days',
+  INTERVAL '1 day'
+) gs(d)
+WHERE s.student_id IS NOT NULL
+AND (
+  (s.day='Thứ 2' AND EXTRACT(ISODOW FROM gs.d)=1) OR
+  (s.day='Thứ 3' AND EXTRACT(ISODOW FROM gs.d)=2) OR
+  (s.day='Thứ 4' AND EXTRACT(ISODOW FROM gs.d)=3) OR
+  (s.day='Thứ 5' AND EXTRACT(ISODOW FROM gs.d)=4) OR
+  (s.day='Thứ 6' AND EXTRACT(ISODOW FROM gs.d)=5) OR
+  (s.day='Thứ 7' AND EXTRACT(ISODOW FROM gs.d)=6) OR
+  (s.day='Chủ nhật' AND EXTRACT(ISODOW FROM gs.d)=7)
+)
+ON CONFLICT(
+  student_id,
+  schedule_id,
+  lesson_date
+)
+DO NOTHING
+`);
 
-    if (!existing) {
-      await db.run(
-        `
-        INSERT INTO schedules (
-          day,
-          time,
-          subject,
-          className,
-          room,
-          studentId
-        )
-        VALUES (?, ?, ?, ?, ?, ?)
-        `,
-        schedule.day,
-        schedule.time,
-        schedule.subject,
-        schedule.className,
-        schedule.room,
-        student.id
-      );
-    }
-  }
-}
-
-/* =========================================================
+/*
+ * ============================================================
  * EXPRESS
- * ========================================================= */
+ * ============================================================
+ */
 
 const app = express();
 
@@ -411,988 +343,1277 @@ app.use(
 
 app.use(express.json());
 
-/* =========================================================
- * HEALTH
- * ========================================================= */
+/*
+ * ============================================================
+ * SELECT HELPERS
+ * ============================================================
+ */
 
-app.get("/api/health", async (req, res) => {
+const studentSelect = `
+  id,
+  name,
+  class_name AS "className",
+  phone,
+  note,
+  fee_per_lesson AS "feePerLesson",
+  active
+`;
+
+const scheduleSelect = `
+  s.id,
+  s.day,
+  s.time,
+  s.subject,
+  s.class_name AS "className",
+  s.room,
+  s.student_id AS "studentId",
+  st.name AS "studentName"
+`;
+
+const lessonSelect = `
+  l.id,
+  l.student_id AS "studentId",
+  l.schedule_id AS "scheduleId",
+  l.lesson_date::text AS "lessonDate",
+  l.time,
+  l.subject,
+  l.class_name AS "className",
+  l.room,
+  l.fee,
+  l.status,
+  l.is_extra AS "isExtra",
+  l.cancelled
+`;
+
+/*
+ * ============================================================
+ * HEALTH
+ * ============================================================
+ */
+
+app.get("/api/health", async (_, res) => {
   try {
-    await db.get("SELECT 1 AS ok");
+    await q("SELECT 1");
 
     res.json({
       success: true,
-      message: "Teacher Schedule Backend is running",
-      database: "SQLite",
+      database: "PostgreSQL",
     });
-  } catch (error) {
-    console.error("Health check error:", error);
-
+  } catch (e) {
     res.status(500).json({
       success: false,
-      message: error.message,
+      message: e.message,
     });
   }
 });
 
-/* =========================================================
+/*
+ * ============================================================
  * STUDENTS
- * ========================================================= */
+ * ============================================================
+ */
 
-app.get("/api/students", async (req, res) => {
-  try {
-    const students = await db.all(`
-      SELECT *
+app.get("/api/students", async (_, res) => {
+  res.json(
+    await q(`
+      SELECT ${studentSelect}
       FROM students
-      ORDER BY name COLLATE NOCASE
-    `);
-
-    res.json(students);
-  } catch (error) {
-    console.error("GET /api/students error:", error);
-
-    res.status(500).json({
-      message: error.message,
-    });
-  }
+      ORDER BY name
+    `)
+  );
 });
 
 app.post("/api/students", async (req, res) => {
-  try {
-    const {
+  const {
+    name,
+    className,
+    phone = "",
+    note = "",
+    feePerLesson = 100000,
+    active = true,
+  } = req.body;
+
+  if (!name || !className) {
+    return res.status(400).json({
+      message: "name và className là bắt buộc",
+    });
+  }
+
+  const rows = await q(
+    `
+    INSERT INTO students(
       name,
-      className,
-      phone = "",
-      note = "",
-      feePerLesson = 100000,
-      active = 1,
-    } = req.body;
-
-    if (!name || !className) {
-      return res.status(400).json({
-        message: "name và className là bắt buộc",
-      });
-    }
-
-    const result = await db.run(
-      `
-      INSERT INTO students (
-        name,
-        className,
-        phone,
-        note,
-        feePerLesson,
-        active
-      )
-      VALUES (?, ?, ?, ?, ?, ?)
-      `,
+      class_name,
+      phone,
+      note,
+      fee_per_lesson,
+      active
+    )
+    VALUES($1,$2,$3,$4,$5,$6)
+    RETURNING ${studentSelect}
+    `,
+    [
       name,
       className,
       phone,
       note,
-      feePerLesson,
-      active ? 1 : 0
-    );
+      Number(feePerLesson),
+      !!active,
+    ]
+  );
 
-    const student = await db.get(
-      "SELECT * FROM students WHERE id = ?",
-      result.lastID
-    );
-
-    res.status(201).json(student);
-  } catch (error) {
-    console.error("POST /api/students error:", error);
-
-    res.status(500).json({
-      message: error.message,
-    });
-  }
+  res.status(201).json(rows[0]);
 });
 
 app.put("/api/students/:id", async (req, res) => {
-  try {
-    const id = Number(req.params.id);
+  const {
+    name,
+    className,
+    phone = "",
+    note = "",
+    feePerLesson = 100000,
+    active = true,
+  } = req.body;
 
-    const {
-      name,
-      className,
-      phone = "",
-      note = "",
-      feePerLesson = 100000,
-      active = 1,
-    } = req.body;
+  const studentId = Number(req.params.id);
+  const newFee = Number(feePerLesson);
 
-    if (!name || !className) {
-      return res.status(400).json({
-        message: "name và className là bắt buộc",
-      });
-    }
-
-    await db.run(
-      `
-      UPDATE students
-      SET
-        name = ?,
-        className = ?,
-        phone = ?,
-        note = ?,
-        feePerLesson = ?,
-        active = ?
-      WHERE id = ?
-      `,
+  const rows = await q(
+    `
+    UPDATE students
+    SET
+      name=$1,
+      class_name=$2,
+      phone=$3,
+      note=$4,
+      fee_per_lesson=$5,
+      active=$6
+    WHERE id=$7
+    RETURNING ${studentSelect}
+    `,
+    [
       name,
       className,
       phone,
       note,
-      feePerLesson,
-      active ? 1 : 0,
-      id
-    );
+      newFee,
+      !!active,
+      studentId,
+    ]
+  );
 
-    const student = await db.get(
-      "SELECT * FROM students WHERE id = ?",
-      id
-    );
-
-    if (!student) {
-      return res.status(404).json({
-        message: "Không tìm thấy học sinh",
-      });
-    }
-
-    res.json(student);
-  } catch (error) {
-    console.error("PUT /api/students error:", error);
-
-    res.status(500).json({
-      message: error.message,
+  if (!rows[0]) {
+    return res.status(404).json({
+      message: "Không tìm thấy học sinh",
     });
   }
+
+  await q(
+    `
+    UPDATE lessons
+    SET fee=$1
+    WHERE student_id=$2
+      AND status='pending'
+      AND is_extra=false
+    `,
+    [
+      newFee,
+      studentId,
+    ]
+  );
+
+  res.json(rows[0]);
 });
 
 app.delete("/api/students/:id", async (req, res) => {
-  try {
-    const id = Number(req.params.id);
+  await q(
+    "DELETE FROM students WHERE id=$1",
+    [Number(req.params.id)]
+  );
 
-    const student = await db.get(
-      "SELECT * FROM students WHERE id = ?",
-      id
-    );
-
-    if (!student) {
-      return res.status(404).json({
-        message: "Không tìm thấy học sinh",
-      });
-    }
-
-    await db.run(
-      "DELETE FROM attendance WHERE studentId = ?",
-      id
-    );
-
-    await db.run(
-      "DELETE FROM payments WHERE studentId = ?",
-      id
-    );
-
-    await db.run(
-      "DELETE FROM share_links WHERE studentId = ?",
-      id
-    );
-
-    await db.run(
-      "DELETE FROM schedules WHERE studentId = ?",
-      id
-    );
-
-    await db.run(
-      "DELETE FROM students WHERE id = ?",
-      id
-    );
-
-    res.json({
-      success: true,
-      message: "Đã xóa học sinh",
-    });
-  } catch (error) {
-    console.error("DELETE /api/students error:", error);
-
-    res.status(500).json({
-      message: error.message,
-    });
-  }
+  res.json({
+    success: true,
+  });
 });
 
-/* =========================================================
+/*
+ * ============================================================
  * CLASSES
- * ========================================================= */
+ * ============================================================
+ */
 
-app.get("/api/classes", async (req, res) => {
-  try {
-    const classes = await db.all(`
-      SELECT *
+app.get("/api/classes", async (_, res) => {
+  res.json(
+    await q(`
+      SELECT id,name,teacher
       FROM classes
       ORDER BY name
-    `);
-
-    res.json(classes);
-  } catch (error) {
-    console.error("GET /api/classes error:", error);
-
-    res.status(500).json({
-      message: error.message,
-    });
-  }
+    `)
+  );
 });
 
-/* =========================================================
+app.post("/api/classes", async (req, res) => {
+  const {
+    name,
+    teacher = "Giáo viên",
+  } = req.body;
+
+  const r = await q(
+    `
+    INSERT INTO classes(name,teacher)
+    VALUES($1,$2)
+    RETURNING id,name,teacher
+    `,
+    [name, teacher]
+  );
+
+  res.status(201).json(r[0]);
+});
+
+/*
+ * ============================================================
  * TIME SLOTS
- * ========================================================= */
+ * ============================================================
+ */
 
-app.get("/api/time-slots", async (req, res) => {
-  try {
-    const slots = await db.all(`
-      SELECT *
+app.get("/api/time-slots", async (_, res) => {
+  res.json(
+    await q(`
+      SELECT
+        id,
+        name,
+        start_time AS "startTime",
+        end_time AS "endTime",
+        sort_order AS "sortOrder"
       FROM time_slots
-      ORDER BY sortOrder
-    `);
-
-    res.json(slots);
-  } catch (error) {
-    console.error("GET /api/time-slots error:", error);
-
-    res.status(500).json({
-      message: error.message,
-    });
-  }
+      ORDER BY sort_order
+    `)
+  );
 });
 
-/* =========================================================
- * SCHEDULES
- * ========================================================= */
+app.post("/api/time-slots", async (req, res) => {
+  const {
+    name,
+    startTime,
+    endTime,
+    sortOrder = 99,
+  } = req.body;
 
-app.get("/api/schedules", async (req, res) => {
-  try {
-    const schedules = await db.all(`
-      SELECT
-        s.*,
-        st.name AS studentName
+  const r = await q(
+    `
+    INSERT INTO time_slots(
+      name,
+      start_time,
+      end_time,
+      sort_order
+    )
+    VALUES($1,$2,$3,$4)
+    RETURNING
+      id,
+      name,
+      start_time AS "startTime",
+      end_time AS "endTime",
+      sort_order AS "sortOrder"
+    `,
+    [
+      name,
+      startTime,
+      endTime,
+      Number(sortOrder),
+    ]
+  );
+
+  res.status(201).json(r[0]);
+});
+
+app.put("/api/time-slots/:id", async (req, res) => {
+  const {
+    name,
+    startTime,
+    endTime,
+    sortOrder = 99,
+  } = req.body;
+
+  const r = await q(
+    `
+    UPDATE time_slots
+    SET
+      name=$1,
+      start_time=$2,
+      end_time=$3,
+      sort_order=$4
+    WHERE id=$5
+    RETURNING
+      id,
+      name,
+      start_time AS "startTime",
+      end_time AS "endTime",
+      sort_order AS "sortOrder"
+    `,
+    [
+      name,
+      startTime,
+      endTime,
+      Number(sortOrder),
+      Number(req.params.id),
+    ]
+  );
+
+  res.json(r[0]);
+});
+
+app.delete("/api/time-slots/:id", async (req, res) => {
+  await q(
+    "DELETE FROM time_slots WHERE id=$1",
+    [Number(req.params.id)]
+  );
+
+  res.json({
+    success: true,
+  });
+});
+
+/*
+ * ============================================================
+ * SCHEDULES
+ * ============================================================
+ */
+
+app.get("/api/schedules", async (_, res) => {
+  res.json(
+    await q(`
+      SELECT ${scheduleSelect}
       FROM schedules s
       LEFT JOIN students st
-        ON st.id = s.studentId
-      ORDER BY
-        CASE s.day
-          WHEN 'Thứ 2' THEN 1
-          WHEN 'Thứ 3' THEN 2
-          WHEN 'Thứ 4' THEN 3
-          WHEN 'Thứ 5' THEN 4
-          WHEN 'Thứ 6' THEN 5
-          WHEN 'Thứ 7' THEN 6
-          WHEN 'Chủ nhật' THEN 7
-          ELSE 99
-        END,
-        s.time
-    `);
-
-    res.json(schedules);
-  } catch (error) {
-    console.error("GET /api/schedules error:", error);
-
-    res.status(500).json({
-      message: error.message,
-    });
-  }
+        ON st.id=s.student_id
+      ORDER BY s.day,s.time
+    `)
+  );
 });
 
 app.post("/api/schedules", async (req, res) => {
-  try {
-    const {
-      day,
-      time,
-      subject,
-      className,
-      room = "",
-      studentId = null,
-    } = req.body;
+  const {
+    day,
+    time,
+    subject,
+    className,
+    room = "",
+    studentId = null,
+  } = req.body;
 
-    if (!day || !time || !subject || !className) {
-      return res.status(400).json({
-        message: "day, time, subject, className là bắt buộc",
-      });
-    }
+  if (!day || !time || !subject || !className) {
+    return res.status(400).json({
+      message: "Thiếu thông tin lịch",
+    });
+  }
 
-    const result = await db.run(
+  const ids = studentId
+    ? [Number(studentId)]
+    : (
+        await q(
+          `
+          SELECT id
+          FROM students
+          WHERE class_name=$1
+            AND active=true
+          `,
+          [className]
+        )
+      ).map(x => x.id);
+
+  let first = null;
+
+  for (const sid of ids) {
+    const r = await q(
       `
-      INSERT INTO schedules (
+      INSERT INTO schedules(
+        day,
+        time,
+        subject,
+        class_name,
+        room,
+        student_id
+      )
+      VALUES($1,$2,$3,$4,$5,$6)
+      RETURNING id
+      `,
+      [
         day,
         time,
         subject,
         className,
         room,
-        studentId
-      )
-      VALUES (?, ?, ?, ?, ?, ?)
-      `,
-      day,
-      time,
-      subject,
-      className,
-      room,
-      studentId || null
+        sid,
+      ]
     );
 
-    const schedule = await db.get(
+    first = r[0] || first;
+  }
+
+  if (!first) {
+    const r = await q(
       `
-      SELECT
-        s.*,
-        st.name AS studentName
+      INSERT INTO schedules(
+        day,
+        time,
+        subject,
+        class_name,
+        room,
+        student_id
+      )
+      VALUES($1,$2,$3,$4,$5,NULL)
+      RETURNING id
+      `,
+      [
+        day,
+        time,
+        subject,
+        className,
+        room,
+      ]
+    );
+
+    first = r[0];
+  }
+
+  const row = (
+    await q(
+      `
+      SELECT ${scheduleSelect}
       FROM schedules s
       LEFT JOIN students st
-        ON st.id = s.studentId
-      WHERE s.id = ?
+        ON st.id=s.student_id
+      WHERE s.id=$1
       `,
-      result.lastID
-    );
+      [first.id]
+    )
+  )[0];
 
-    res.status(201).json(schedule);
-  } catch (error) {
-    console.error("POST /api/schedules error:", error);
-
-    res.status(500).json({
-      message: error.message,
-    });
-  }
+  res.status(201).json(row);
 });
 
 app.put("/api/schedules/:id", async (req, res) => {
-  try {
-    const id = Number(req.params.id);
+  const {
+    day,
+    time,
+    subject,
+    className,
+    room = "",
+    studentId = null,
+  } = req.body;
 
-    const {
-      day,
-      time,
-      subject,
-      className,
-      room = "",
-      studentId = null,
-    } = req.body;
-
-    await db.run(
-      `
-      UPDATE schedules
-      SET
-        day = ?,
-        time = ?,
-        subject = ?,
-        className = ?,
-        room = ?,
-        studentId = ?
-      WHERE id = ?
-      `,
+  const r = await q(
+    `
+    UPDATE schedules
+    SET
+      day=$1,
+      time=$2,
+      subject=$3,
+      class_name=$4,
+      room=$5,
+      student_id=$6
+    WHERE id=$7
+    RETURNING id
+    `,
+    [
       day,
       time,
       subject,
       className,
       room,
-      studentId || null,
-      id
-    );
+      studentId ? Number(studentId) : null,
+      Number(req.params.id),
+    ]
+  );
 
-    const schedule = await db.get(
-      `
-      SELECT
-        s.*,
-        st.name AS studentName
-      FROM schedules s
-      LEFT JOIN students st
-        ON st.id = s.studentId
-      WHERE s.id = ?
-      `,
-      id
-    );
-
-    if (!schedule) {
-      return res.status(404).json({
-        message: "Không tìm thấy lịch học",
-      });
-    }
-
-    res.json(schedule);
-  } catch (error) {
-    console.error("PUT /api/schedules error:", error);
-
-    res.status(500).json({
-      message: error.message,
+  if (!r[0]) {
+    return res.status(404).json({
+      message: "Không tìm thấy lịch",
     });
   }
+
+  const row = (
+    await q(
+      `
+      SELECT ${scheduleSelect}
+      FROM schedules s
+      LEFT JOIN students st
+        ON st.id=s.student_id
+      WHERE s.id=$1
+      `,
+      [r[0].id]
+    )
+  )[0];
+
+  res.json(row);
 });
 
 app.delete("/api/schedules/:id", async (req, res) => {
-  try {
-    const id = Number(req.params.id);
+  await q(
+    "DELETE FROM schedules WHERE id=$1",
+    [Number(req.params.id)]
+  );
 
-    await db.run(
-      "DELETE FROM schedules WHERE id = ?",
-      id
+  res.json({
+    success: true,
+  });
+});
+
+/*
+ * ============================================================
+ * DAY NUMBER
+ * ============================================================
+ */
+
+function dayNumber(day) {
+  return {
+    "Thứ 2": 1,
+    "Thứ 3": 2,
+    "Thứ 4": 3,
+    "Thứ 5": 4,
+    "Thứ 6": 5,
+    "Thứ 7": 6,
+    "Chủ nhật": 7,
+  }[day] || 0;
+}
+
+/*
+ * ============================================================
+ * LESSONS
+ * ============================================================
+ */
+
+app.get("/api/lessons", async (req, res) => {
+  try {
+    const { from, to } = getDateRange(req);
+
+    const schedules = await q(`
+      SELECT
+        s.*,
+        st.fee_per_lesson
+      FROM schedules s
+      JOIN students st
+        ON st.id=s.student_id
+      WHERE s.student_id IS NOT NULL
+    `);
+
+    for (const s of schedules) {
+      const dayNo = dayNumber(s.day);
+
+      if (!dayNo) {
+        continue;
+      }
+
+      await q(
+        `
+        INSERT INTO lessons(
+          student_id,
+          schedule_id,
+          lesson_date,
+          time,
+          subject,
+          class_name,
+          room,
+          fee,
+          status,
+          is_extra
+        )
+        SELECT
+          $1,
+          $2,
+          d::date,
+          $3,
+          $4,
+          $5,
+          $6,
+          $7,
+          'pending',
+          false
+        FROM generate_series(
+          $8::date,
+          $9::date,
+          INTERVAL '1 day'
+        ) d
+        WHERE EXTRACT(ISODOW FROM d)=$10
+        ON CONFLICT(
+          student_id,
+          schedule_id,
+          lesson_date
+        )
+        DO NOTHING
+        `,
+        [
+          s.student_id,
+          s.id,
+          s.time,
+          s.subject,
+          s.class_name,
+          s.room,
+          Number(s.fee_per_lesson || 0),
+          from,
+          to,
+          dayNo,
+        ]
+      );
+    }
+
+    const lessons = await q(
+      `
+      SELECT
+        ${lessonSelect},
+        st.name AS "studentName"
+      FROM lessons l
+      JOIN students st
+        ON st.id=l.student_id
+      WHERE l.lesson_date BETWEEN $1 AND $2
+        AND l.cancelled=false
+      ORDER BY
+        l.lesson_date DESC,
+        l.time
+      `,
+      [from, to]
     );
 
-    res.json({
-      success: true,
-      message: "Đã xóa lịch học",
-    });
+    res.json(lessons);
   } catch (error) {
-    console.error("DELETE /api/schedules error:", error);
+    console.error("GET /api/lessons error:", error);
 
-    res.status(500).json({
+    res.status(400).json({
       message: error.message,
     });
   }
 });
 
-/* =========================================================
+app.post("/api/lessons", async (req, res) => {
+  const {
+    studentId,
+    lessonDate,
+    time,
+    subject,
+    className = "",
+    room = "",
+    fee,
+  } = req.body;
+
+  if (!studentId || !lessonDate || !time || !subject) {
+    return res.status(400).json({
+      message:
+        "Học sinh, ngày, giờ và môn là bắt buộc",
+    });
+  }
+
+  if (!isValidDateString(lessonDate)) {
+    return res.status(400).json({
+      message:
+        "Ngày học không hợp lệ: " + lessonDate,
+    });
+  }
+
+  const s = (
+    await q(
+      `
+      SELECT
+        class_name,
+        fee_per_lesson
+      FROM students
+      WHERE id=$1
+      `,
+      [Number(studentId)]
+    )
+  )[0];
+
+  if (!s) {
+    return res.status(404).json({
+      message: "Không tìm thấy học sinh",
+    });
+  }
+
+  const r = await q(
+    `
+    INSERT INTO lessons(
+      student_id,
+      lesson_date,
+      time,
+      subject,
+      class_name,
+      room,
+      fee,
+      status,
+      is_extra
+    )
+    VALUES(
+      $1,$2,$3,$4,$5,$6,$7,
+      'pending',
+      true
+    )
+    RETURNING id
+    `,
+    [
+      Number(studentId),
+      lessonDate,
+      time,
+      subject,
+      className || s.class_name || "",
+      room,
+      Number(fee ?? s.fee_per_lesson ?? 0),
+    ]
+  );
+
+  const row = (
+    await q(
+      `
+      SELECT
+        ${lessonSelect},
+        st.name AS "studentName"
+      FROM lessons l
+      JOIN students st
+        ON st.id=l.student_id
+      WHERE l.id=$1
+      `,
+      [r[0].id]
+    )
+  )[0];
+
+  res.status(201).json(row);
+});
+
+app.delete("/api/lessons/:id", async (req, res) => {
+  const lessonId = Number(req.params.id);
+
+  await q(
+    `
+    UPDATE lessons
+    SET cancelled=true
+    WHERE id=$1
+    `,
+    [lessonId]
+  );
+
+  await q(
+    `
+    DELETE FROM attendance
+    WHERE lesson_id=$1
+    `,
+    [lessonId]
+  );
+
+  res.json({
+    success: true,
+  });
+});
+
+/*
+ * ============================================================
  * ATTENDANCE
- * ========================================================= */
+ * ============================================================
+ */
 
 app.get("/api/attendance", async (req, res) => {
-  try {
-    const {
-      studentId,
-      from,
-      to,
-    } = req.query;
+  const params = [];
+  let where = "1=1";
 
-    let sql = `
-      SELECT
-        a.*,
-        st.name AS studentName,
-        s.subject,
-        s.day,
-        s.time
-      FROM attendance a
-      LEFT JOIN students st
-        ON st.id = a.studentId
-      LEFT JOIN schedules s
-        ON s.id = a.scheduleId
-      WHERE 1 = 1
-    `;
-
-    const params = [];
-
-    if (studentId) {
-      sql += " AND a.studentId = ?";
-      params.push(Number(studentId));
-    }
-
-    if (from) {
-      sql += " AND a.lessonDate >= ?";
-      params.push(from);
-    }
-
-    if (to) {
-      sql += " AND a.lessonDate <= ?";
-      params.push(to);
-    }
-
-    sql += `
-      ORDER BY
-        a.lessonDate DESC,
-        a.id DESC
-    `;
-
-    const rows = await db.all(sql, ...params);
-
-    res.json(rows);
-  } catch (error) {
-    console.error("GET /api/attendance error:", error);
-
-    res.status(500).json({
-      message: error.message,
-    });
+  if (req.query.studentId) {
+    params.push(Number(req.query.studentId));
+    where += ` AND a.student_id=$${params.length}`;
   }
-});
 
-app.post("/api/attendance", async (req, res) => {
-  try {
-    const {
-      studentId,
-      scheduleId = null,
-      lessonDate,
-      status = "attended",
-      fee = 0,
-      note = "",
-    } = req.body;
-
-    if (!studentId || !lessonDate) {
+  if (req.query.from) {
+    if (!isValidDateString(req.query.from)) {
       return res.status(400).json({
-        message: "studentId và lessonDate là bắt buộc",
+        message:
+          "Ngày from không hợp lệ: " +
+          req.query.from,
       });
     }
 
-    const existing = await db.get(
+    params.push(req.query.from);
+    where += ` AND a.lesson_date>=$${params.length}`;
+  }
+
+  if (req.query.to) {
+    if (!isValidDateString(req.query.to)) {
+      return res.status(400).json({
+        message:
+          "Ngày to không hợp lệ: " +
+          req.query.to,
+      });
+    }
+
+    params.push(req.query.to);
+    where += ` AND a.lesson_date<=$${params.length}`;
+  }
+
+  res.json(
+    await q(
+      `
+      SELECT
+        a.id,
+        a.student_id AS "studentId",
+        a.lesson_id AS "lessonId",
+        a.schedule_id AS "scheduleId",
+        a.lesson_date::text AS "lessonDate",
+        a.status,
+        a.fee,
+        a.note,
+        st.name AS "studentName",
+        COALESCE(l.time,s.time) AS time,
+        COALESCE(l.subject,s.subject) AS subject,
+        s.day
+      FROM attendance a
+      JOIN students st
+        ON st.id=a.student_id
+      LEFT JOIN lessons l
+        ON l.id=a.lesson_id
+      LEFT JOIN schedules s
+        ON s.id=a.schedule_id
+      WHERE ${where}
+      ORDER BY
+        a.lesson_date DESC,
+        a.id DESC
+      `,
+      params
+    )
+  );
+});
+
+app.post("/api/attendance", async (req, res) => {
+  const {
+    studentId,
+    lessonId = null,
+    scheduleId = null,
+    lessonDate,
+    status = "attended",
+    fee = null,
+    note = "",
+  } = req.body;
+
+  if (!studentId || !lessonDate) {
+    return res.status(400).json({
+      message:
+        "studentId và lessonDate là bắt buộc",
+    });
+  }
+
+  if (!isValidDateString(lessonDate)) {
+    return res.status(400).json({
+      message:
+        "lessonDate không hợp lệ: " +
+        lessonDate,
+    });
+  }
+
+  const student = (
+    await q(
+      `
+      SELECT fee_per_lesson
+      FROM students
+      WHERE id=$1
+      `,
+      [Number(studentId)]
+    )
+  )[0];
+
+  if (!student) {
+    return res.status(404).json({
+      message: "Không tìm thấy học sinh",
+    });
+  }
+
+  const finalFee =
+    status === "attended"
+      ? Number(
+          fee ??
+          student.fee_per_lesson ??
+          0
+        )
+      : 0;
+
+  if (lessonId) {
+    await q(
+      `
+      UPDATE lessons
+      SET
+        status=$1,
+        fee=$2
+      WHERE id=$3
+      `,
+      [
+        status,
+        finalFee,
+        Number(lessonId),
+      ]
+    );
+
+    const ex = await q(
       `
       SELECT id
       FROM attendance
-      WHERE studentId = ?
-        AND scheduleId IS ?
-        AND lessonDate = ?
+      WHERE lesson_id=$1
       `,
-      studentId,
-      scheduleId || null,
-      lessonDate
+      [Number(lessonId)]
     );
 
-    let id;
-
-    if (existing) {
-      await db.run(
+    if (ex[0]) {
+      await q(
         `
         UPDATE attendance
         SET
-          status = ?,
-          fee = ?,
-          note = ?
-        WHERE id = ?
+          status=$1,
+          fee=$2,
+          note=$3,
+          lesson_date=$4
+        WHERE id=$5
         `,
-        status,
-        fee,
-        note,
-        existing.id
-      );
-
-      id = existing.id;
-    } else {
-      const result = await db.run(
-        `
-        INSERT INTO attendance (
-          studentId,
-          scheduleId,
+        [
+          status,
+          finalFee,
+          note,
           lessonDate,
+          ex[0].id,
+        ]
+      );
+    } else {
+      await q(
+        `
+        INSERT INTO attendance(
+          student_id,
+          lesson_id,
+          schedule_id,
+          lesson_date,
           status,
           fee,
           note
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES(
+          $1,$2,$3,$4,$5,$6,$7
+        )
         `,
-        studentId,
-        scheduleId || null,
+        [
+          Number(studentId),
+          Number(lessonId),
+          scheduleId
+            ? Number(scheduleId)
+            : null,
+          lessonDate,
+          status,
+          finalFee,
+          note,
+        ]
+      );
+    }
+  } else {
+    const ex = await q(
+      `
+      SELECT id
+      FROM attendance
+      WHERE student_id=$1
+        AND lesson_id IS NULL
+        AND lesson_date=$2
+      `,
+      [
+        Number(studentId),
         lessonDate,
-        status,
-        fee,
-        note
+      ]
+    );
+
+    if (ex[0]) {
+      await q(
+        `
+        UPDATE attendance
+        SET
+          status=$1,
+          fee=$2,
+          note=$3
+        WHERE id=$4
+        `,
+        [
+          status,
+          finalFee,
+          note,
+          ex[0].id,
+        ]
       );
-
-      id = result.lastID;
+    } else {
+      await q(
+        `
+        INSERT INTO attendance(
+          student_id,
+          schedule_id,
+          lesson_date,
+          status,
+          fee,
+          note
+        )
+        VALUES(
+          $1,$2,$3,$4,$5,$6
+        )
+        `,
+        [
+          Number(studentId),
+          scheduleId
+            ? Number(scheduleId)
+            : null,
+          lessonDate,
+          status,
+          finalFee,
+          note,
+        ]
+      );
     }
-
-    const attendance = await db.get(
-      `
-      SELECT *
-      FROM attendance
-      WHERE id = ?
-      `,
-      id
-    );
-
-    res.status(201).json(attendance);
-  } catch (error) {
-    console.error("POST /api/attendance error:", error);
-
-    res.status(500).json({
-      message: error.message,
-    });
   }
-});
 
-/* =========================================================
- * STUDENT SUMMARY
- * ========================================================= */
-
-app.get("/api/summary/:studentId", async (req, res) => {
-  try {
-    const studentId = Number(req.params.studentId);
-
-    const student = await db.get(
-      `
-      SELECT *
-      FROM students
-      WHERE id = ?
-      `,
-      studentId
-    );
-
-    if (!student) {
-      return res.status(404).json({
-        message: "Không tìm thấy học sinh",
-      });
-    }
-
-    const attendance = await db.all(
-      `
-      SELECT *
-      FROM attendance
-      WHERE studentId = ?
-      ORDER BY lessonDate DESC
-      `,
-      studentId
-    );
-
-    const payment = await db.get(
+  const row = (
+    await q(
       `
       SELECT
-        COALESCE(SUM(amount), 0) AS totalPaid
-      FROM payments
-      WHERE studentId = ?
+        a.id,
+        a.student_id AS "studentId",
+        a.lesson_id AS "lessonId",
+        a.schedule_id AS "scheduleId",
+        a.lesson_date::text AS "lessonDate",
+        a.status,
+        a.fee,
+        a.note,
+        st.name AS "studentName"
+      FROM attendance a
+      JOIN students st
+        ON st.id=a.student_id
+      WHERE a.student_id=$1
+        AND a.lesson_date=$2
+      ORDER BY a.id DESC
+      LIMIT 1
       `,
-      studentId
-    );
+      [
+        Number(studentId),
+        lessonDate,
+      ]
+    )
+  )[0];
 
-    const totalLessons = attendance.length;
-
-    const attendedLessons = attendance.filter(
-      (item) => item.status === "attended"
-    ).length;
-
-    const absentLessons = attendance.filter(
-      (item) => item.status === "absent"
-    ).length;
-
-    const totalFee = attendance
-      .filter((item) => item.status === "attended")
-      .reduce(
-        (sum, item) =>
-          sum + Number(item.fee || student.feePerLesson || 0),
-        0
-      );
-
-    const totalPaid = Number(payment?.totalPaid || 0);
-
-    res.json({
-      student,
-      totalLessons,
-      attendedLessons,
-      absentLessons,
-      totalFee,
-      totalPaid,
-      remaining: totalFee - totalPaid,
-      attendance,
-    });
-  } catch (error) {
-    console.error("GET /api/summary error:", error);
-
-    res.status(500).json({
-      message: error.message,
-    });
-  }
+  res.status(201).json(row);
 });
 
-/* =========================================================
+/*
+ * ============================================================
  * PAYMENTS
- * ========================================================= */
+ * ============================================================
+ */
 
-app.get("/api/payments", async (req, res) => {
-  try {
-    const { studentId, month } = req.query;
-
-    let sql = `
+app.get("/api/payments", async (_, res) => {
+  res.json(
+    await q(`
       SELECT
-        p.*,
-        s.name AS studentName
-      FROM payments p
-      LEFT JOIN students s
-        ON s.id = p.studentId
-      WHERE 1 = 1
-    `;
-
-    const params = [];
-
-    if (studentId) {
-      sql += " AND p.studentId = ?";
-      params.push(Number(studentId));
-    }
-
-    if (month) {
-      sql += " AND p.month = ?";
-      params.push(month);
-    }
-
-    sql += " ORDER BY p.paidAt DESC, p.id DESC";
-
-    const payments = await db.all(sql, ...params);
-
-    res.json(payments);
-  } catch (error) {
-    console.error("GET /api/payments error:", error);
-
-    res.status(500).json({
-      message: error.message,
-    });
-  }
+        id,
+        student_id AS "studentId",
+        month,
+        amount,
+        paid_at AS "paidAt",
+        note
+      FROM payments
+      ORDER BY paid_at DESC
+    `)
+  );
 });
 
 app.post("/api/payments", async (req, res) => {
-  try {
-    const {
-      studentId,
+  const {
+    studentId,
+    month,
+    amount,
+    note = "",
+  } = req.body;
+
+  if (!studentId || !month) {
+    return res.status(400).json({
+      message:
+        "studentId và month là bắt buộc",
+    });
+  }
+
+  const r = await q(
+    `
+    INSERT INTO payments(
+      student_id,
       month,
       amount,
-      paidAt,
-      note = "",
-    } = req.body;
-
-    if (!studentId || !month || amount == null) {
-      return res.status(400).json({
-        message: "studentId, month và amount là bắt buộc",
-      });
-    }
-
-    const result = await db.run(
-      `
-      INSERT INTO payments (
-        studentId,
-        month,
-        amount,
-        paidAt,
-        note
-      )
-      VALUES (?, ?, ?, ?, ?)
-      `,
-      studentId,
+      note
+    )
+    VALUES($1,$2,$3,$4)
+    RETURNING
+      id,
+      student_id AS "studentId",
+      month,
+      amount,
+      paid_at AS "paidAt",
+      note
+    `,
+    [
+      Number(studentId),
       month,
       Number(amount),
-      paidAt || new Date().toISOString(),
-      note
-    );
+      note,
+    ]
+  );
 
-    const payment = await db.get(
-      `
-      SELECT
-        p.*,
-        s.name AS studentName
-      FROM payments p
-      LEFT JOIN students s
-        ON s.id = p.studentId
-      WHERE p.id = ?
-      `,
-      result.lastID
-    );
-
-    res.status(201).json(payment);
-  } catch (error) {
-    console.error("POST /api/payments error:", error);
-
-    res.status(500).json({
-      message: error.message,
-    });
-  }
+  res.status(201).json(r[0]);
 });
 
-/* =========================================================
+/*
+ * ============================================================
  * SETTINGS
- * ========================================================= */
+ * ============================================================
+ */
 
-app.get("/api/settings", async (req, res) => {
-  try {
-    const settings = await db.get(
-      `
-      SELECT *
-      FROM app_settings
-      WHERE id = 1
-      `
-    );
+app.get("/api/settings", async (_, res) => {
+  const r = await q(`
+    SELECT
+      teacher_name AS "teacherName",
+      teacher_phone AS "teacherPhone",
+      bank_account AS "bankAccount",
+      bank_owner AS "bankOwner",
+      bank_name AS "bankName",
+      parent_note AS "parentNote"
+    FROM app_settings
+    WHERE id=1
+  `);
 
-    res.json(settings);
-  } catch (error) {
-    console.error("GET /api/settings error:", error);
-
-    res.status(500).json({
-      message: error.message,
-    });
-  }
+  res.json(r[0]);
 });
 
 app.put("/api/settings", async (req, res) => {
-  try {
-    const {
+  const {
+    teacherName = "",
+    teacherPhone = "",
+    bankAccount = "",
+    bankOwner = "",
+    bankName = "",
+    parentNote = "",
+  } = req.body;
+
+  const r = await q(
+    `
+    UPDATE app_settings
+    SET
+      teacher_name=$1,
+      teacher_phone=$2,
+      bank_account=$3,
+      bank_owner=$4,
+      bank_name=$5,
+      parent_note=$6
+    WHERE id=1
+    RETURNING
+      teacher_name AS "teacherName",
+      teacher_phone AS "teacherPhone",
+      bank_account AS "bankAccount",
+      bank_owner AS "bankOwner",
+      bank_name AS "bankName",
+      parent_note AS "parentNote"
+    `,
+    [
       teacherName,
       teacherPhone,
       bankAccount,
       bankOwner,
       bankName,
       parentNote,
-    } = req.body;
+    ]
+  );
 
-    await db.run(
-      `
-      UPDATE app_settings
-      SET
-        teacherName = COALESCE(?, teacherName),
-        teacherPhone = COALESCE(?, teacherPhone),
-        bankAccount = COALESCE(?, bankAccount),
-        bankOwner = COALESCE(?, bankOwner),
-        bankName = COALESCE(?, bankName),
-        parentNote = COALESCE(?, parentNote)
-      WHERE id = 1
-      `,
-      teacherName ?? null,
-      teacherPhone ?? null,
-      bankAccount ?? null,
-      bankOwner ?? null,
-      bankName ?? null,
-      parentNote ?? null
-    );
-
-    const settings = await db.get(
-      `
-      SELECT *
-      FROM app_settings
-      WHERE id = 1
-      `
-    );
-
-    res.json(settings);
-  } catch (error) {
-    console.error("PUT /api/settings error:", error);
-
-    res.status(500).json({
-      message: error.message,
-    });
-  }
+  res.json(r[0]);
 });
 
-/* =========================================================
+/*
+ * ============================================================
  * SHARE LINKS
- * ========================================================= */
+ * ============================================================
+ */
 
 app.post("/api/share-links", async (req, res) => {
-  try {
-    const { studentId } = req.body;
+  const studentId = Number(req.body.studentId);
 
-    if (!studentId) {
-      return res.status(400).json({
-        message: "studentId là bắt buộc",
-      });
-    }
+  let r = await q(
+    `
+    SELECT token
+    FROM share_links
+    WHERE student_id=$1
+    LIMIT 1
+    `,
+    [studentId]
+  );
 
-    const student = await db.get(
+  if (!r[0]) {
+    const token =
+      crypto.randomBytes(16).toString("hex");
+
+    r = await q(
       `
-      SELECT *
-      FROM students
-      WHERE id = ?
-      `,
-      studentId
-    );
-
-    if (!student) {
-      return res.status(404).json({
-        message: "Không tìm thấy học sinh",
-      });
-    }
-
-    const token = crypto.randomBytes(24).toString("hex");
-
-    const result = await db.run(
-      `
-      INSERT INTO share_links (
-        studentId,
+      INSERT INTO share_links(
+        student_id,
         token
       )
-      VALUES (?, ?)
+      VALUES($1,$2)
+      RETURNING token
       `,
-      studentId,
-      token
+      [
+        studentId,
+        token,
+      ]
     );
-
-    const shareLink = await db.get(
-      `
-      SELECT *
-      FROM share_links
-      WHERE id = ?
-      `,
-      result.lastID
-    );
-
-    res.status(201).json(shareLink);
-  } catch (error) {
-    console.error("POST /api/share-links error:", error);
-
-    res.status(500).json({
-      message: error.message,
-    });
   }
+
+  res.json({
+    token: r[0].token,
+  });
 });
 
 app.get("/api/share/:token", async (req, res) => {
   try {
-    const { token } = req.params;
+    const s = (
+      await q(
+        `
+        SELECT
+          st.id,
+          st.name,
+          st.class_name AS "className",
+          sl.token
+        FROM share_links sl
+        JOIN students st
+          ON st.id=sl.student_id
+        WHERE sl.token=$1
+        `,
+        [req.params.token]
+      )
+    )[0];
 
-    const shareLink = await db.get(
-      `
-      SELECT *
-      FROM share_links
-      WHERE token = ?
-      `,
-      token
-    );
-
-    if (!shareLink) {
+    if (!s) {
       return res.status(404).json({
-        message: "Link chia sẻ không tồn tại",
+        message: "Link không hợp lệ",
       });
     }
 
-    const student = await db.get(
-      `
-      SELECT *
-      FROM students
-      WHERE id = ?
-      `,
-      shareLink.studentId
-    );
-
-    if (!student) {
-      return res.status(404).json({
-        message: "Không tìm thấy học sinh",
-      });
-    }
-
-    const attendance = await db.all(
+    /*
+     * Lấy toàn bộ lịch học đã tạo của học sinh.
+     *
+     * Không giới hạn theo tháng để frontend có thể
+     * chuyển qua tuần trước / tuần sau.
+     */
+    const lessons = await q(
       `
       SELECT
-        a.*,
-        s.subject,
-        s.day,
-        s.time
-      FROM attendance a
-      LEFT JOIN schedules s
-        ON s.id = a.scheduleId
-      WHERE a.studentId = ?
-      ORDER BY a.lessonDate DESC
+        ${lessonSelect}
+      FROM lessons l
+      WHERE l.student_id=$1
+        AND l.cancelled=false
+      ORDER BY
+        l.lesson_date,
+        l.time
       `,
-      student.id
-    );
-
-    const payments = await db.all(
-      `
-      SELECT *
-      FROM payments
-      WHERE studentId = ?
-      ORDER BY paidAt DESC
-      `,
-      student.id
-    );
-
-    const settings = await db.get(
-      `
-      SELECT *
-      FROM app_settings
-      WHERE id = 1
-      `
+      [s.id]
     );
 
     res.json({
-      student,
-      attendance,
-      payments,
-      settings,
+      student: s,
+      lessons,
     });
   } catch (error) {
     console.error("GET /api/share/:token error:", error);
@@ -1403,37 +1624,32 @@ app.get("/api/share/:token", async (req, res) => {
   }
 });
 
-/* =========================================================
- * 404
- * ========================================================= */
-
-app.use((req, res) => {
-  res.status(404).json({
-    message: "API endpoint không tồn tại",
-    path: req.path,
-  });
-});
-
-/* =========================================================
+/*
+ * ============================================================
  * ERROR HANDLER
- * ========================================================= */
+ * ============================================================
+ */
 
-app.use((error, req, res, next) => {
-  console.error("Unhandled error:", error);
+app.use((err, req, res, next) => {
+  console.error(err);
 
   res.status(500).json({
-    message: error.message || "Internal Server Error",
+    message: err.message,
   });
 });
 
-/* =========================================================
- * START SERVER
- * ========================================================= */
+/*
+ * ============================================================
+ * SERVER
+ * ============================================================
+ */
 
-const PORT = Number(process.env.PORT) || 4000;
-const HOST = "0.0.0.0";
-
-app.listen(PORT, HOST, () => {
-  console.log(`Teacher Schedule Backend running on ${HOST}:${PORT}`);
-  console.log(`Database: ${path.join(dataDir, "teacher_schedule.db")}`);
-});
+app.listen(
+  PORT,
+  "0.0.0.0",
+  () => {
+    console.log(
+      `Teacher Schedule API running on ${PORT}`
+    );
+  }
+);

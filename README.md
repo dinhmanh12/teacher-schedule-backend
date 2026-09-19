@@ -1,20 +1,13 @@
-# Teacher Schedule Backend v2
+# Teacher Schedule Backend
 
-## Chạy local
-```bash
-npm install
-npm start
-```
+## Render + PostgreSQL
+Set these Environment Variables in the Render Web Service:
 
-API: http://localhost:4000/api/health
+- `DATABASE_URL`: Internal Database URL of the Render PostgreSQL database
+- `PORT`: Render provides this automatically; the server listens on `process.env.PORT`
 
-## Tính năng v2
-- Học sinh có học phí/buổi.
-- Điểm danh từng buổi: attended/absent.
-- Tự tính tổng tiền đã học và số tiền còn lại.
-- Ghi nhận thanh toán.
-- Link chia sẻ riêng từng học sinh.
-- Cấu hình giờ/tiết học bằng time-slots.
+Build/Start:
+- Build command: `npm install`
+- Start command: `npm start`
 
-## Lưu ý deploy
-SQLite phù hợp để chạy local/demo. Khi deploy production trên Render nên chuyển DB sang PostgreSQL/Supabase để dữ liệu không phụ thuộc filesystem của server.
+The backend now uses PostgreSQL and creates its tables automatically on first start. Do not commit the real database password to GitHub.
