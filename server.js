@@ -1458,6 +1458,119 @@ app.post("/api/payments", async (req, res) => {
   res.status(201).json(r[0]);
 });
 
+app.put("/api/payments/monthly", async (req, res) => {
+  try {
+    const {
+      studentId,
+      month,
+      amount,
+      note = "",
+    } = req.body;
+
+    const sid = Number(studentId);
+    const value = Number(amount);
+
+    // Cho phép amount = 0
+    if (!Number.isInteger(sid) || sid <= 0) {
+      return res.status(400).json({
+        message: "studentId không hợp lệ",
+      });
+    }
+
+    if (!month) {
+      return res.status(400).json({
+        message: "month là bắt buộc",
+      });
+    }
+
+    if (!Number.isFinite(value) || value < 0) {
+      return res.status(400).json({
+        message: "amount phải là số >= 0",
+      });
+    }
+
+    // Kiểm tra học sinh
+    const student = await q(
+      `
+      SELECT id
+      FROM students
+      WHERE id=$1
+      `,
+      [sid]
+    );
+
+    if (!student[0]) {
+      return res.status(404).json({
+        message: "Không tìm thấy học sinh",
+      });
+    }
+
+    /*
+     * Xóa toàn bộ các khoản thu cũ của học sinh
+     * trong tháng.
+     *
+     * Sau đó nếu amount > 0 thì tạo lại một record
+     * duy nhất.
+     *
+     * amount = 0 => không tạo record mới.
+     * Kết quả tổng "Đã thu" sẽ chính xác bằng 0.
+     */
+    await q(
+      `
+      DELETE FROM payments
+      WHERE student_id=$1
+        AND month=$2
+      `,
+      [sid, month]
+    );
+
+    let row = null;
+
+    if (value > 0) {
+      const result = await q(
+        `
+        INSERT INTO payments(
+          student_id,
+          month,
+          amount,
+          note
+        )
+        VALUES($1,$2,$3,$4)
+        RETURNING
+          id,
+          student_id AS "studentId",
+          month,
+          amount,
+          paid_at AS "paidAt",
+          note
+        `,
+        [
+          sid,
+          month,
+          value,
+          note,
+        ]
+      );
+
+      row = result[0];
+    }
+
+    res.json({
+      success: true,
+      amount: value,
+      payment: row,
+    });
+  } catch (error) {
+    console.error(
+      "PUT /api/payments/monthly error:",
+      error
+    );
+
+    res.status(500).json({
+      message: error.message,
+    });
+  }
+});
 /*
  * ============================================================
  * SETTINGS
