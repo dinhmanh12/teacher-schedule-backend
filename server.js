@@ -2,10 +2,44 @@ import express from "express";
 import cors from "cors";
 import pg from "pg";
 import crypto from "crypto";
+import fs from "fs/promises";
+import path from "path";
+import { fileURLToPath } from "url";
 import "dotenv/config";
 
 const { Pool } = pg;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
+const QR_FILE = path.join(__dirname, "qr-code.txt");
+
+async function readQrCode() {
+  try {
+    return await fs.readFile(QR_FILE, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return "";
+    }
+
+    throw error;
+  }
+}
+
+async function saveQrCode(qrCode) {
+  if (!qrCode) {
+    await fs.rm(QR_FILE, {
+      force: true,
+    });
+
+    return;
+  }
+
+  await fs.writeFile(
+    QR_FILE,
+    qrCode,
+    "utf8"
+  );
+}
 const PORT = Number(process.env.PORT || 4000);
 
 const pool = new Pool({
@@ -341,7 +375,11 @@ app.use(
   })
 );
 
-app.use(express.json());
+app.use(
+  express.json({
+    limit: "5mb",
+  })
+);
 
 /*
  * ============================================================
@@ -1077,6 +1115,230 @@ app.post("/api/lessons", async (req, res) => {
   res.status(201).json(row);
 });
 
+/*
+ * ============================================================
+ * RECURRING LESSONS
+ * Tạo ca học lặp hàng tuần từ ngày bắt đầu đến hết năm
+ * ============================================================
+ */
+
+app.post("/api/lessons/recurring", async (req, res) => {
+  try {
+    const {
+      studentId,
+      startDate,
+      dayOfWeek,
+      time,
+      subject,
+      className = "",
+      room = "",
+      fee,
+    } = req.body;
+
+    const sid = Number(studentId);
+    const dayNo = Number(dayOfWeek);
+
+    if (!sid || !startDate || !time || !subject) {
+      return res.status(400).json({
+        message:
+          "Học sinh, ngày bắt đầu, giờ và môn là bắt buộc",
+      });
+    }
+
+    if (!isValidDateString(startDate)) {
+      return res.status(400).json({
+        message:
+          "Ngày bắt đầu không hợp lệ: " + startDate,
+      });
+    }
+
+    if (!Number.isInteger(dayNo) || dayNo < 1 || dayNo > 7) {
+      return res.status(400).json({
+        message:
+          "dayOfWeek phải từ 1 đến 7",
+      });
+    }
+
+    // Kiểm tra học sinh
+    const student = (
+      await q(
+        `
+        SELECT
+          id,
+          class_name,
+          fee_per_lesson
+        FROM students
+        WHERE id=$1
+        `,
+        [sid]
+      )
+    )[0];
+
+    if (!student) {
+      return res.status(404).json({
+        message: "Không tìm thấy học sinh",
+      });
+    }
+
+    const finalClassName =
+      className || student.class_name || "";
+
+    const finalFee =
+      Number(fee ?? student.fee_per_lesson ?? 0);
+
+    /*
+     * Tên thứ theo cấu trúc schedules hiện tại
+     */
+    const dayNames = {
+      1: "Thứ 2",
+      2: "Thứ 3",
+      3: "Thứ 4",
+      4: "Thứ 5",
+      5: "Thứ 6",
+      6: "Thứ 7",
+      7: "Chủ nhật",
+    };
+
+    const day = dayNames[dayNo];
+
+    /*
+     * Tạo schedule đại diện cho ca học.
+     *
+     * schedule này được dùng để:
+     * - biết ca học lặp vào thứ nào
+     * - liên kết các lessons
+     * - hiển thị lịch
+     */
+    const scheduleResult = await q(
+      `
+      INSERT INTO schedules(
+        day,
+        time,
+        subject,
+        class_name,
+        room,
+        student_id
+      )
+      VALUES($1,$2,$3,$4,$5,$6)
+      RETURNING id
+      `,
+      [
+        day,
+        time,
+        subject,
+        finalClassName,
+        room,
+        sid,
+      ]
+    );
+
+    const scheduleId = scheduleResult[0].id;
+
+    /*
+     * Tạo tất cả buổi học:
+     *
+     * startDate
+     *    ↓
+     * đúng thứ đã chọn
+     *    ↓
+     * mỗi 7 ngày
+     *    ↓
+     * 31/12
+     */
+    const lessons = await q(
+      `
+      INSERT INTO lessons(
+        student_id,
+        schedule_id,
+        lesson_date,
+        time,
+        subject,
+        class_name,
+        room,
+        fee,
+        status,
+        is_extra
+      )
+      SELECT
+        $1,
+        $2,
+        d::date,
+        $3,
+        $4,
+        $5,
+        $6,
+        $7,
+        'pending',
+        false
+      FROM generate_series(
+        $8::date,
+        make_date(
+          EXTRACT(YEAR FROM $8::date)::integer,
+          12,
+          31
+        ),
+        INTERVAL '1 day'
+      ) d
+      WHERE EXTRACT(ISODOW FROM d)=$9
+      ORDER BY d
+      RETURNING
+        id,
+        lesson_date::text AS "lessonDate"
+      `,
+      [
+        sid,
+        scheduleId,
+        time,
+        subject,
+        finalClassName,
+        room,
+        finalFee,
+        startDate,
+        dayNo,
+      ]
+    );
+
+    /*
+     * Lấy lại đầy đủ lesson để frontend
+     * có thể cập nhật state ngay.
+     */
+    const createdLessons = await q(
+      `
+      SELECT
+        ${lessonSelect},
+        st.name AS "studentName"
+      FROM lessons l
+      JOIN students st
+        ON st.id=l.student_id
+      WHERE l.schedule_id=$1
+        AND l.cancelled=false
+      ORDER BY
+        l.lesson_date,
+        l.time
+      `,
+      [scheduleId]
+    );
+
+    res.status(201).json({
+      success: true,
+      scheduleId,
+      day,
+      count: createdLessons.length,
+      lessons: createdLessons,
+    });
+
+  } catch (error) {
+    console.error(
+      "POST /api/lessons/recurring error:",
+      error
+    );
+
+    res.status(500).json({
+      message: error.message,
+    });
+  }
+});
+
 app.delete("/api/lessons/:id", async (req, res) => {
   const lessonId = Number(req.params.id);
 
@@ -1577,20 +1839,124 @@ app.put("/api/payments/monthly", async (req, res) => {
  * ============================================================
  */
 
-app.get("/api/settings", async (_, res) => {
-  const r = await q(`
-    SELECT
-      teacher_name AS "teacherName",
-      teacher_phone AS "teacherPhone",
-      bank_account AS "bankAccount",
-      bank_owner AS "bankOwner",
-      bank_name AS "bankName",
-      parent_note AS "parentNote"
-    FROM app_settings
-    WHERE id=1
-  `);
+/*
+ * ============================================================
+ * SETTINGS
+ * ============================================================
+ */
 
-  res.json(r[0]);
+app.get("/api/settings", async (_, res) => {
+  try {
+    const r = await q(`
+      SELECT
+        teacher_name AS "teacherName",
+        teacher_phone AS "teacherPhone",
+        bank_account AS "bankAccount",
+        bank_owner AS "bankOwner",
+        bank_name AS "bankName",
+        parent_note AS "parentNote"
+      FROM app_settings
+      WHERE id=1
+    `);
+
+    const qrCode = await readQrCode();
+
+    res.json({
+      ...(r[0] || {}),
+      qrCode,
+    });
+  } catch (error) {
+    console.error(
+      "GET /api/settings error:",
+      error
+    );
+
+    res.status(500).json({
+      message: error.message,
+    });
+  }
+});
+
+app.put("/api/settings", async (req, res) => {
+  try {
+    const {
+      teacherName = "",
+      teacherPhone = "",
+      bankAccount = "",
+      bankOwner = "",
+      bankName = "",
+      parentNote = "",
+      qrCode,
+    } = req.body;
+
+    /*
+     * Chỉ cập nhật thông tin settings vào database.
+     *
+     * QR code KHÔNG lưu vào database.
+     * QR được lưu thành file qr-code.txt.
+     */
+
+    const r = await q(
+      `
+      UPDATE app_settings
+      SET
+        teacher_name=$1,
+        teacher_phone=$2,
+        bank_account=$3,
+        bank_owner=$4,
+        bank_name=$5,
+        parent_note=$6
+      WHERE id=1
+      RETURNING
+        teacher_name AS "teacherName",
+        teacher_phone AS "teacherPhone",
+        bank_account AS "bankAccount",
+        bank_owner AS "bankOwner",
+        bank_name AS "bankName",
+        parent_note AS "parentNote"
+      `,
+      [
+        teacherName,
+        teacherPhone,
+        bankAccount,
+        bankOwner,
+        bankName,
+        parentNote,
+      ]
+    );
+
+    /*
+     * Chỉ ghi QR khi frontend gửi qrCode.
+     *
+     * Nếu qrCode = ""
+     * => xóa QR hiện tại.
+     */
+    if (qrCode !== undefined) {
+      if (typeof qrCode !== "string") {
+        return res.status(400).json({
+          message: "qrCode phải là chuỗi",
+        });
+      }
+
+      await saveQrCode(qrCode);
+    }
+
+    const currentQrCode = await readQrCode();
+
+    res.json({
+      ...(r[0] || {}),
+      qrCode: currentQrCode,
+    });
+  } catch (error) {
+    console.error(
+      "PUT /api/settings error:",
+      error
+    );
+
+    res.status(500).json({
+      message: error.message,
+    });
+  }
 });
 
 app.put("/api/settings", async (req, res) => {
