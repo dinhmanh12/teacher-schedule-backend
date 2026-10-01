@@ -177,6 +177,10 @@ CREATE TABLE IF NOT EXISTS students (
   active BOOLEAN NOT NULL DEFAULT TRUE
 );
 
+-- Nhận xét riêng của từng học sinh (tự động bổ sung cho database cũ)
+ALTER TABLE students
+  ADD COLUMN IF NOT EXISTS comment TEXT NOT NULL DEFAULT '';
+
 CREATE TABLE IF NOT EXISTS classes (
   id SERIAL PRIMARY KEY,
   name TEXT NOT NULL UNIQUE,
@@ -393,6 +397,7 @@ const studentSelect = `
   class_name AS "className",
   phone,
   note,
+  comment,
   fee_per_lesson AS "feePerLesson",
   active
 `;
@@ -467,6 +472,7 @@ app.post("/api/students", async (req, res) => {
     className,
     phone = "",
     note = "",
+    comment = "",
     feePerLesson = 100000,
     active = true,
   } = req.body;
@@ -484,10 +490,11 @@ app.post("/api/students", async (req, res) => {
       class_name,
       phone,
       note,
+      comment,
       fee_per_lesson,
       active
     )
-    VALUES($1,$2,$3,$4,$5,$6)
+    VALUES($1,$2,$3,$4,$5,$6,$7)
     RETURNING ${studentSelect}
     `,
     [
@@ -495,6 +502,7 @@ app.post("/api/students", async (req, res) => {
       className,
       phone,
       note,
+      comment,
       Number(feePerLesson),
       !!active,
     ]
@@ -509,6 +517,7 @@ app.put("/api/students/:id", async (req, res) => {
     className,
     phone = "",
     note = "",
+    comment = "",
     feePerLesson = 100000,
     active = true,
   } = req.body;
@@ -524,9 +533,10 @@ app.put("/api/students/:id", async (req, res) => {
       class_name=$2,
       phone=$3,
       note=$4,
-      fee_per_lesson=$5,
-      active=$6
-    WHERE id=$7
+      comment=$5,
+      fee_per_lesson=$6,
+      active=$7
+    WHERE id=$8
     RETURNING ${studentSelect}
     `,
     [
@@ -534,6 +544,7 @@ app.put("/api/students/:id", async (req, res) => {
       className,
       phone,
       note,
+      comment,
       newFee,
       !!active,
       studentId,
